@@ -3,7 +3,7 @@ from datetime import date, datetime, time, timedelta
 
 from aiogram import Bot, F, Router, html
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -100,7 +100,7 @@ async def wizard_edit(
 async def require_owner(message: Message, db: Database) -> sqlite3.Row | None:
     teacher = db.get_teacher_by_telegram(message.from_user.id)
     if teacher is None:
-        await message.answer("Этот бот уже закреплен за репетитором. Попросите invite-ссылку.")
+        await message.answer("Нажмите /start, чтобы зарегистрироваться как репетитор.")
         return None
     return teacher
 
@@ -117,14 +117,6 @@ async def start(message: Message, state: FSMContext, db: Database) -> None:
         )
         return
 
-    if db.is_student(message.from_user.id):
-        await message.answer("Вы уже подключены как ученик и будете получать напоминания здесь.")
-        return
-
-    if db.owner_exists():
-        await message.answer("Этот бот уже закреплен за репетитором. Попросите invite-ссылку.")
-        return
-
     teacher = db.upsert_teacher(message.from_user.id, user_name(message))
     await message.answer(
         "👋 Добро пожаловать!\n\n"
@@ -134,6 +126,23 @@ async def start(message: Message, state: FSMContext, db: Database) -> None:
         "Следующий шаг: добавьте первого ученика.",
         reply_markup=main_menu(),
     )
+
+
+@router.message(Command("stop"))
+async def stop(message: Message, state: FSMContext, db: Database) -> None:
+    await state.clear()
+    if db.delete_teacher_by_telegram(message.from_user.id):
+        await message.answer(
+            "Готово. Вы удалены из списка репетиторов.\n\n"
+            "Если захотите снова вести расписание, отправьте /start."
+        )
+        return
+
+    if db.is_student(message.from_user.id):
+        await message.answer("Вы не зарегистрированы как репетитор. Как ученик вы продолжите получать напоминания.")
+        return
+
+    await message.answer("Вы не зарегистрированы как репетитор. Чтобы начать, отправьте /start.")
 
 
 @router.message(F.text == BTN_ADD_STUDENT)

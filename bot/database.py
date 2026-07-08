@@ -100,6 +100,50 @@ class Database:
                     ON schedule_rules(teacher_id, is_active);
                 CREATE INDEX IF NOT EXISTS idx_reminders_due
                     ON reminders(sent_at, remind_at);
+
+                CREATE TRIGGER IF NOT EXISTS lessons_student_teacher_insert
+                BEFORE INSERT ON lessons
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM students
+                    WHERE students.id = NEW.student_id
+                      AND students.teacher_id = NEW.teacher_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'student does not belong to teacher');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS lessons_student_teacher_update
+                BEFORE UPDATE OF teacher_id, student_id ON lessons
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM students
+                    WHERE students.id = NEW.student_id
+                      AND students.teacher_id = NEW.teacher_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'student does not belong to teacher');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS schedule_rules_student_teacher_insert
+                BEFORE INSERT ON schedule_rules
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM students
+                    WHERE students.id = NEW.student_id
+                      AND students.teacher_id = NEW.teacher_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'student does not belong to teacher');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS schedule_rules_student_teacher_update
+                BEFORE UPDATE OF teacher_id, student_id ON schedule_rules
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM students
+                    WHERE students.id = NEW.student_id
+                      AND students.teacher_id = NEW.teacher_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'student does not belong to teacher');
+                END;
                 """
             )
             self._ensure_teacher_columns(conn)
@@ -150,6 +194,14 @@ class Database:
             return conn.execute(
                 "SELECT * FROM teachers WHERE telegram_id = ?", (telegram_id,)
             ).fetchone()
+
+    def delete_teacher_by_telegram(self, telegram_id: int) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM teachers WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            return cursor.rowcount > 0
 
     def is_student(self, telegram_id: int) -> bool:
         with self.connect() as conn:
@@ -288,18 +340,15 @@ class Database:
         starts_at_utc: datetime,
         reminder_kinds: list[str],
     ) -> tuple[int, int]:
-        now = utc_now_iso()
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO lessons (teacher_id, student_id, starts_at, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (teacher_id, student_id, to_utc_iso(starts_at_utc), now),
+            self._ensure_students_belong_to_teacher(conn, teacher_id, [student_id])
+            return self._insert_lesson(
+                conn,
+                teacher_id,
+                student_id,
+                starts_at_utc,
+                reminder_kinds,
             )
-            lesson_id = int(cursor.lastrowid)
-            created = self._insert_reminders(conn, lesson_id, starts_at_utc, reminder_kinds)
-            return lesson_id, created
 
     def create_lessons(
         self,
@@ -310,16 +359,19 @@ class Database:
     ) -> tuple[int, int]:
         lessons_created = 0
         reminders_created = 0
-        for student_id in student_ids:
-            for starts_at in starts_at_values:
-                _lesson_id, reminder_count = self.create_lesson(
-                    teacher_id,
-                    student_id,
-                    starts_at,
-                    reminder_kinds,
-                )
-                lessons_created += 1
-                reminders_created += reminder_count
+        with self.connect() as conn:
+            self._ensure_students_belong_to_teacher(conn, teacher_id, student_ids)
+            for student_id in student_ids:
+                for starts_at in starts_at_values:
+                    _lesson_id, reminder_count = self._insert_lesson(
+                        conn,
+                        teacher_id,
+                        student_id,
+                        starts_at,
+                        reminder_kinds,
+                    )
+                    lessons_created += 1
+                    reminders_created += reminder_count
         return lessons_created, reminders_created
 
     def get_lesson_for_teacher(
@@ -493,6 +545,7 @@ class Database:
         reminders_value = ",".join(sorted(reminder_kinds))
         created = 0
         with self.connect() as conn:
+            self._ensure_students_belong_to_teacher(conn, teacher_id, student_ids)
             for student_id in student_ids:
                 conn.execute(
                     """
@@ -627,3 +680,43 @@ class Database:
             )
             created += 1
         return created
+
+    def _insert_lesson(
+        self,
+        conn: sqlite3.Connection,
+        teacher_id: int,
+        student_id: int,
+        starts_at_utc: datetime,
+        reminder_kinds: list[str],
+    ) -> tuple[int, int]:
+        cursor = conn.execute(
+            """
+            INSERT INTO lessons (teacher_id, student_id, starts_at, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (teacher_id, student_id, to_utc_iso(starts_at_utc), utc_now_iso()),
+        )
+        lesson_id = int(cursor.lastrowid)
+        created = self._insert_reminders(conn, lesson_id, starts_at_utc, reminder_kinds)
+        return lesson_id, created
+
+    def _ensure_students_belong_to_teacher(
+        self,
+        conn: sqlite3.Connection,
+        teacher_id: int,
+        student_ids: list[int],
+    ) -> None:
+        unique_ids = sorted(set(student_ids))
+        if not unique_ids:
+            return
+
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = conn.execute(
+            f"""
+            SELECT id FROM students
+            WHERE teacher_id = ? AND id IN ({placeholders})
+            """,
+            (teacher_id, *unique_ids),
+        ).fetchall()
+        if len(rows) != len(unique_ids):
+            raise ValueError("All students must belong to the teacher")

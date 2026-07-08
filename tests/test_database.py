@@ -1,3 +1,4 @@
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,6 +53,149 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(changed, 2)
         self.assertTrue(self.db.delete_lesson(teacher["id"], lesson_id))
         self.assertEqual(len(self.db.list_upcoming_lessons(teacher["id"])), 0)
+
+    def test_multiple_teachers_can_register_and_invite_students(self) -> None:
+        first_teacher = self.db.upsert_teacher(1, "First Teacher")
+        second_teacher = self.db.upsert_teacher(2, "Second Teacher")
+
+        first_status, first_invite = self.db.accept_invite(
+            self.db.create_invite(first_teacher["id"]),
+            10,
+            "First Student",
+        )
+        second_status, second_invite = self.db.accept_invite(
+            self.db.create_invite(second_teacher["id"]),
+            20,
+            "Second Student",
+        )
+
+        self.assertEqual(first_status, "ok")
+        self.assertEqual(second_status, "ok")
+        self.assertEqual(first_invite["teacher_name"], "First Teacher")
+        self.assertEqual(second_invite["teacher_name"], "Second Teacher")
+        self.assertEqual(len(self.db.list_students(first_teacher["id"])), 1)
+        self.assertEqual(len(self.db.list_students(second_teacher["id"])), 1)
+
+    def test_delete_teacher_by_telegram_removes_teacher_data_only(self) -> None:
+        first_teacher = self.db.upsert_teacher(1, "First Teacher")
+        second_teacher = self.db.upsert_teacher(2, "Second Teacher")
+        first_code = self.db.create_invite(first_teacher["id"])
+        second_code = self.db.create_invite(second_teacher["id"])
+        self.db.accept_invite(first_code, 10, "First Student")
+        self.db.accept_invite(second_code, 20, "Second Student")
+        first_student = self.db.list_students(first_teacher["id"])[0]
+        self.db.create_lesson(
+            first_teacher["id"],
+            first_student["id"],
+            datetime.now(timezone.utc) + timedelta(days=2),
+            ["day", "hour"],
+        )
+
+        self.assertTrue(self.db.delete_teacher_by_telegram(1))
+
+        self.assertIsNone(self.db.get_teacher_by_telegram(1))
+        self.assertIsNotNone(self.db.get_teacher_by_telegram(2))
+        self.assertEqual(len(self.db.list_students(first_teacher["id"])), 0)
+        self.assertEqual(len(self.db.list_upcoming_lessons(first_teacher["id"])), 0)
+        self.assertEqual(len(self.db.list_students(second_teacher["id"])), 1)
+        self.assertTrue(self.db.is_student(20))
+
+    def test_lesson_creation_rejects_student_from_another_teacher(self) -> None:
+        first_teacher = self.db.upsert_teacher(1, "First Teacher")
+        second_teacher = self.db.upsert_teacher(2, "Second Teacher")
+        self.db.accept_invite(self.db.create_invite(first_teacher["id"]), 10, "First Student")
+        self.db.accept_invite(self.db.create_invite(second_teacher["id"]), 20, "Second Student")
+        first_student = self.db.list_students(first_teacher["id"])[0]
+        second_student = self.db.list_students(second_teacher["id"])[0]
+
+        with self.assertRaisesRegex(ValueError, "students"):
+            self.db.create_lesson(
+                first_teacher["id"],
+                second_student["id"],
+                datetime.now(timezone.utc) + timedelta(days=2),
+                ["day"],
+            )
+        with self.assertRaisesRegex(ValueError, "students"):
+            self.db.create_lessons(
+                first_teacher["id"],
+                [first_student["id"], second_student["id"]],
+                [datetime.now(timezone.utc) + timedelta(days=2)],
+                ["day"],
+            )
+
+        self.assertEqual(len(self.db.list_upcoming_lessons(first_teacher["id"])), 0)
+        self.assertEqual(len(self.db.list_upcoming_lessons(second_teacher["id"])), 0)
+
+    def test_schedule_rule_creation_rejects_student_from_another_teacher(self) -> None:
+        first_teacher = self.db.upsert_teacher(1, "First Teacher")
+        second_teacher = self.db.upsert_teacher(2, "Second Teacher")
+        self.db.accept_invite(self.db.create_invite(first_teacher["id"]), 10, "First Student")
+        self.db.accept_invite(self.db.create_invite(second_teacher["id"]), 20, "Second Student")
+        first_student = self.db.list_students(first_teacher["id"])[0]
+        second_student = self.db.list_students(second_teacher["id"])[0]
+
+        with self.assertRaisesRegex(ValueError, "students"):
+            self.db.create_schedule_rules(
+                first_teacher["id"],
+                [first_student["id"], second_student["id"]],
+                [1, 3],
+                "18:00",
+                "2026-07-07",
+                "2026-12-31",
+                ["day", "hour"],
+            )
+
+        self.assertEqual(len(self.db.list_active_schedule_rules(first_teacher["id"])), 0)
+        self.assertEqual(len(self.db.list_active_schedule_rules(second_teacher["id"])), 0)
+
+    def test_database_trigger_rejects_cross_teacher_lesson_insert(self) -> None:
+        first_teacher = self.db.upsert_teacher(1, "First Teacher")
+        second_teacher = self.db.upsert_teacher(2, "Second Teacher")
+        self.db.accept_invite(self.db.create_invite(second_teacher["id"]), 20, "Second Student")
+        second_student = self.db.list_students(second_teacher["id"])[0]
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            with self.db.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO lessons (teacher_id, student_id, starts_at, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        first_teacher["id"],
+                        second_student["id"],
+                        datetime.now(timezone.utc).isoformat(),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+
+    def test_database_trigger_rejects_cross_teacher_schedule_rule_insert(self) -> None:
+        first_teacher = self.db.upsert_teacher(1, "First Teacher")
+        second_teacher = self.db.upsert_teacher(2, "Second Teacher")
+        self.db.accept_invite(self.db.create_invite(second_teacher["id"]), 20, "Second Student")
+        second_student = self.db.list_students(second_teacher["id"])[0]
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            with self.db.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO schedule_rules (
+                        teacher_id, student_id, weekdays, lesson_time,
+                        start_date, end_date, reminders, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        first_teacher["id"],
+                        second_student["id"],
+                        "1,3",
+                        "18:00",
+                        "2026-07-07",
+                        "2026-12-31",
+                        "day,hour",
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
 
     def test_invite_cannot_be_reused_by_another_student(self) -> None:
         teacher = self.db.upsert_teacher(1, "Teacher")
